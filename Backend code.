@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+queuectl.py - Minimal job queue CLI with workers, retries, exponential backoff and DLQ.
+
+Usage examples:
+  python queuectl.py init
+  python queuectl.py enqueue '{"id":"job1","command":"echo hello","max_retries":3}'
+  python queuectl.py worker start --count 2
+  python queuectl.py status
+  python queuectl.py list --state pending
+  python queuectl.py dlq list
+  python queuectl.py dlq retry job1
+  python queuectl.py config set max_retries 5
+"""
+
+import os
+import sqlite3
+import json
+import uuid
+import time
+import datetime
+import subprocess
+import signal
+import sys
+from multiprocessing import Process
+import click
+
+DB_PATH = os.getenv("QUEUECTL_DB", "queuectl.db")
+PID_DIR = os.getenv("QUEUECTL_PID_DIR", ".queuectl_pids")
+STOP_FLAG = os.path.join(PID_DIR, "STOP")
+
+# default config values
+DEFAULT_CONFIG = {
+    "max_retries": "3",
+    "backoff_base": "2",
+    "backoff_cap_seconds": "3600"  # cap on backoff to avoid astronomical waits
+}
+
+# Utilities
+def now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def ensure_db():
+    os.makedirs(PID_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)  # autocommit off for transactions
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    c = conn.cursor()
+    # jobs table holds all jobs incl dead
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        command TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        max_retries INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        run_after INTEGER DEFAULT 0, -- epoch seconds, schedule for backoff
+        last_exit_code INTEGER DEFAULT NULL,
+        last_output TEXT DEFAULT NULL
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    """)
+    # initialize config defaults if missing
+    for k, v in DEFAULT_CONFIG.items():
+        c.execute("INSERT OR IGNORE INTO config(key,value) VALUES(?,?)", (k, v))
+    conn.commit()
+    return conn
+
+# Config helpers
+def config_set(conn, key, value):
+    conn.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+def config_get(conn, key):
+    cur = conn.execute("SELECT value FROM config WHERE key = ?", (key,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+# CLI implementation
+@click.group()
+def cli():
+    pass
+
+@cli.command()
+def init():
+    """Initialize the database and config."""
+    ensure_db()
+    click.echo(f"Initialized DB at {DB_PATH}")
+
+@cli.command()
+@click.argument("job_json")
+def enqueue(job_json):
+    """Enqueue a job. Provide a JSON object (id optional). Example:
+       queuectl enqueue '{"command":"sleep 2","max_retries":3}'"""
+    conn = ensure_db()
+    try:
+        job = json.loads(job_json)
+    except json.JSONDecodeError as e:
+        click.echo("Invalid JSON: " + str(e), err=True)
+        sys.exit(1)
+
+    job_id = job.get("id") or str(uuid.uuid4())
+    command = job.get("command")
+    if not command:
+        click.echo("Missing 'command' in job JSON", err=True)
+        sys.exit(1)
+    max_retries = int(job.get("max_retries", config_get(conn, "max_retries") or DEFAULT_CONFIG["max_retries"]))
+    created = job.get("created_at", now_iso())
+    attempts = 0
+    state = "pending"
+    updated = created
+    with conn:
+        try:
+            conn.execute("""
+            INSERT INTO jobs(id,command,state,attempts,max_retries,created_at,updated_at,run_after)
+            VALUES(?,?,?,?,?,?,?,?)
+            """, (job_id, command, state, attempts, max_retries, created, updated, 0))
+        except sqlite3.IntegrityError:
+            click.echo(f"Job with id {job_id} already exists", err=True)
+            sys.exit(1)
+    click.echo(f"Enqueued job {job_id}")
+
+@cli.group()
+def worker():
+    """Worker management (start/stop)"""
+    pass
+
+def worker_loop(worker_name):
+    """
+    Single worker loop. Picks an available pending job atomically and executes it.
+    Honors run_after (scheduled time) for exponential backoff.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    pid = os.getpid()
+    click.echo(f"[{worker_name}] started pid={pid}")
+    stop = False
+
+    def handle_sigterm(signum, frame):
+        nonlocal stop
+        click.echo(f"[{worker_name}] received stop signal, will exit after current job.")
+        stop = True
+
+    signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    backoff_base = float(config_get(conn, "backoff_base") or DEFAULT_CONFIG["backoff_base"])
+    backoff_cap = int(config_get(conn, "backoff_cap_seconds") or DEFAULT_CONFIG["backoff_cap_seconds"])
+
+    while not stop:
+        # check STOP flag file for external stop request
+        if os.path.exists(STOP_FLAG):
+            click.echo(f"[{worker_name}] STOP flag detected; exiting after current job.")
+            break
+
+        # 1) Atomically pick one pending job whose run_after <= now
+        now_epoch = int(time.time())
+        cur = conn.cursor()
+        try:
+            # Begin immediate transaction to lock DB for this operation
+            conn.execute("BEGIN IMMEDIATE")
+            # SELECT one eligible job
+            row = cur.execute("""
+                SELECT id, command, attempts, max_retries
+                FROM jobs
+                WHERE state = 'pending' AND (run_after IS NULL OR run_after <= ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, (now_epoch,)).fetchone()
+            if not row:
+                conn.execute("COMMIT")
+                # no job available; sleep a bit and loop
+                time.sleep(0.8)
+                continue
+
+            job_id, command, attempts, max_retries = row
+            # mark as processing and increment attempts (we choose to increment when starting attempt)
+            updated_at = now_iso()
+            cur.execute("""
+                UPDATE jobs
+                SET state='processing', attempts=attempts+1, updated_at=?
+                WHERE id=? AND state='pending'
+            """, (updated_at, job_id))
+            if cur.rowcount != 1:
+                # someone else grabbed it, rollback and continue
+                conn.execute("ROLLBACK")
+                continue
+            conn.execute("COMMIT")
+        except sqlite3.OperationalError as e:
+            # lock contention; back off
+            try:
+                conn.execute("ROLLBACK")
+            except:
+                pass
+            time.sleep(0.5)
+            continue
+
+        # Execute the command (shell) and capture exit code
+        click.echo(f"[{worker_name}] executing job {job_id}: {command} (attempt {attempts+1})")
+        try:
+            # run command as shell command to support typical 'sleep 2' / 'echo hi'
+            proc = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=None)
+            exit_code = proc.returncode
+            output_text = proc.stdout.decode(errors="ignore") if proc.stdout is not None else ""
+        except Exception as e:
+            exit_code = 127
+            output_text = f"exception: {e}"
+
+        # decide next state based on exit_code
+        if exit_code == 0:
+            # success
+            with conn:
+                conn.execute("""
+                    UPDATE jobs
+                    SET state='completed', last_exit_code=?, last_output=?, updated_at=?
+                    WHERE id=?
+                """, (exit_code, output_text[:10000], now_iso(), job_id))
+            click.echo(f"[{worker_name}] job {job_id} completed")
+        else:
+            # failure path -> either retry or move to dead
+            with conn:
+                # fetch current attempts and max_retries (attempt was incremented earlier)
+                r = conn.execute("SELECT attempts, max_retries FROM jobs WHERE id=?", (job_id,)).fetchone()
+                attempts_now, max_retries_now = r
+                if attempts_now <= max_retries_now:
+                    # schedule next attempt with exponential backoff
+                    delay = min(backoff_cap, int(backoff_base ** attempts_now))
+                    next_run_after = int(time.time()) + delay
+                    conn.execute("""
+                        UPDATE jobs
+                        SET state='pending', run_after=?, last_exit_code=?, last_output=?, updated_at=?
+                        WHERE id=?
+                    """, (next_run_after, exit_code, output_text[:10000], now_iso(), job_id))
+                    click.echo(f"[{worker_name}] job {job_id} failed (exit={exit_code}). Retrying in {delay}s (attempt {attempts_now}/{max_retries_now}).")
+                else:
+                    # move to dead
+                    conn.execute("""
+                        UPDATE jobs
+                        SET state='dead', last_exit_code=?, last_output=?, updated_at=?
+                        WHERE id=?
+                    """, (exit_code, output_text[:10000], now_iso(), job_id))
+                    click.echo(f"[{worker_name}] job {job_id} moved to DLQ (dead) after {attempts_now}/{max_retries_now} attempts.")
+
+        # allow loop to be interruptible
+        time.sleep(0.05)
+
+    click.echo(f"[{worker_name}] exiting.")
+
+@worker.command("start")
+@click.option("--count", default=1, help="Number of worker processes to start")
+def worker_start(count):
+    """Start worker(s). This command starts worker processes in foreground and writes their PIDs to .queuectl_pids"""
+    ensure_db()
+    os.makedirs(PID_DIR, exist_ok=True)
+    procs = []
+    for i in range(count):
+        name = f"worker-{int(time.time())}-{i}"
+        p = Process(target=worker_loop, args=(name,), daemon=False)
+        p.start()
+        pidfile = os.path.join(PID_DIR, f"{p.pid}.pid")
+        with open(pidfile, "w") as f:
+            f.write(str(p.pid))
+        click.echo(f"Started {name} pid={p.pid} (pidfile={pidfile})")
+        procs.append(p)
+
+    click.echo("Workers started in foreground. Press Ctrl+C to stop; or run 'queuectl worker stop' to request graceful stop.")
+    try:
+        for p in procs:
+            p.join()
+    except KeyboardInterrupt:
+        click.echo("Main process received KeyboardInterrupt, signaling workers to stop...")
+        # write STOP flag file
+        open(STOP_FLAG, "w").close()
+        for p in procs:
+            p.join(timeout=10)
+        if os.path.exists(STOP_FLAG):
+            os.remove(STOP_FLAG)
+        click.echo("Workers stopped.")
+
+@worker.command("stop")
+def worker_stop():
+    """Signal workers to stop gracefully by writing a STOP flag that workers observe."""
+    os.makedirs(PID_DIR, exist_ok=True)
+    with open(STOP_FLAG, "w") as f:
+        f.write("stop")
+    click.echo("STOP flag created. Running workers will exit after finishing current job.")
+    # optionally remove pidfiles (not mandatory)
+    time.sleep(0.5)
+
+@cli.command()
+def status():
+    """Show summary of job states and active worker PIDs."""
+    conn = ensure_db()
+    cur = conn.execute("SELECT state, COUNT(*) FROM jobs GROUP BY state")
+    totals = {row[0]: row[1] for row in cur.fetchall()}
+    click.echo("Job counts by state:")
+    for s in ["pending", "processing", "completed", "failed", "dead"]:
+        click.echo(f"  {s:10} : {totals.get(s,0)}")
+    # list active worker pids (pidfiles)
+    pids = []
+    if os.path.isdir(PID_DIR):
+        for fname in os.listdir(PID_DIR):
+            if fname.endswith(".pid"):
+                try:
+                    with open(os.path.join(PID_DIR, fname)) as f:
+                        pids.append(int(f.read().strip()))
+                except:
+                    pass
+    click.echo(f"Active worker pidfiles in {PID_DIR}: {len(pids)}")
+    for pid in pids:
+        click.echo(f"  pid {pid}")
+
+@cli.command()
+@click.option("--state", default=None, help="Filter by state (pending, processing, completed, dead)")
+def list(state):
+    """List jobs, optionally filtered by state."""
+    conn = ensure_db()
+    q = "SELECT id, command, state, attempts, max_retries, created_at, updated_at FROM jobs"
+    params = ()
+    if state:
+        q += " WHERE state = ?"
+        params = (state,)
+    q += " ORDER BY created_at DESC LIMIT 200"
+    for row in conn.execute(q, params):
+        click.echo(json.dumps({
+            "id": row[0],
+            "command": row[1],
+            "state": row[2],
+            "attempts": row[3],
+            "max_retries": row[4],
+            "created_at": row[5],
+            "updated_at": row[6]
+        }))
+
+@cli.group()
+def dlq():
+    """Dead Letter Queue operations."""
+    pass
+
+@dlq.command("list")
+def dlq_list():
+    conn = ensure_db()
+    for row in conn.execute("SELECT id, command, attempts, max_retries, created_at, updated_at, last_exit_code FROM jobs WHERE state='dead' ORDER BY updated_at DESC"):
+        click.echo(json.dumps({
+            "id": row[0],
+            "command": row[1],
+            "attempts": row[2],
+            "max_retries": row[3],
+            "created_at": row[4],
+            "updated_at": row[5],
+            "last_exit_code": row[6]
+        }))
+
+@dlq.command("retry")
+@click.argument("job_id")
+def dlq_retry(job_id):
+    """Retry a DLQ job - move it back to pending and reset attempts (or you can choose to leave attempts)"""
+    conn = ensure_db()
+    r = conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not r:
+        click.echo(f"No job {job_id}", err=True)
+        sys.exit(1)
+    state = r[0]
+    if state != "dead":
+        click.echo(f"Job {job_id} is not dead; current state={state}", err=True)
+        sys.exit(1)
+    # reset attempts to 0 and set state to pending (and run_after = now)
+    with conn:
+        conn.execute("UPDATE jobs SET state='pending', attempts=0, run_after=0, updated_at=? WHERE id=?", (now_iso(), job_id))
+    click.echo(f"Job {job_id} moved from DLQ to pending")
+
+@cli.group()
+def config():
+    """Configuration management."""
+    pass
+
+@config.command("set")
+@click.argument("key")
+@click.argument("value")
+def config_set_cmd(key, value):
+    conn = ensure_db()
+    config_set(conn, key, value)
+    click.echo(f"Config {key} set to {value}")
+
+@config.command("get")
+@click.argument("key")
+def config_get_cmd(key):
+    conn = ensure_db()
+    v = config_get(conn, key)
+    if v is None:
+        click.echo(f"{key} not set")
+    else:
+        click.echo(f"{key} = {v}")
+
+# small helper to show DB contents for testing (not part of required API)
+@cli.command()
+def debug_dump():
+    conn = ensure_db()
+    for row in conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 200"):
+        click.echo(str(row))
+
+
+if _name_ == "_main_":
+    cli()
